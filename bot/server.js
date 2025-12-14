@@ -2,12 +2,15 @@ import "dotenv/config";
 import express from "express";
 import multer from "multer";
 import fs from "fs";
+import path from "path";
 import OpenAI from "openai";
+import pdfParse from "pdf-parse";
+import mammoth from "mammoth";
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// CORS
+// CORS (ok für einfache Mobile-Nutzung)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-token");
@@ -22,38 +25,112 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 let VECTOR_STORE_ID = process.env.VECTOR_STORE_ID || null;
 const API_TOKEN = process.env.API_TOKEN || "";
 
-// Token-Schutz
+// --- Minimaler Zugriffsschutz für /api/* (wichtig sobald öffentlich) ---
 app.use("/api", (req, res, next) => {
-  if (!API_TOKEN) return next();
+  if (!API_TOKEN) return next(); // nicht empfohlen
   const token = req.headers["x-api-token"];
   if (token !== API_TOKEN) return res.status(401).json({ error: "Unauthorized" });
   next();
 });
 
-function safeUnlink(path) { fs.unlink(path, () => {}); }
+// --- Helpers ---
+function safeUnlink(p) {
+  fs.unlink(p, () => {});
+}
 
 async function ensureVectorStore() {
   if (VECTOR_STORE_ID) return VECTOR_STORE_ID;
-  const vs = await openai.vectorStores.create({ name: "employee_onboarding_kb" });
+
+  const vs = await openai.vectorStores.create({
+    name: "employee_onboarding_kb"
+  });
+
   VECTOR_STORE_ID = vs.id;
   console.log("✅ Created vector store:", VECTOR_STORE_ID);
-  console.log("👉 Copy this into Render ENV as VECTOR_STORE_ID to persist it.");
+  console.log("👉 Tipp: Setze VECTOR_STORE_ID als Render Env Var, damit der Index erhalten bleibt.");
   return VECTOR_STORE_ID;
 }
 
-async function waitForVectorFileReady(vectorStoreId, fileId, { timeoutMs = 180000, pollMs = 2000 } = {}) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const list = await openai.vectorStores.files.list({ vector_store_id: vectorStoreId });
-    const match = list.data?.find((x) => x.file_id === fileId);
-    const status = match?.status || "unknown";
-    if (status === "completed") return true;
-    if (status === "failed") throw new Error(`Vector store processing failed for file ${fileId}`);
-    await new Promise((r) => setTimeout(r, pollMs));
-  }
-  return false;
+function normalizeText(s) {
+  return (s || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
+/**
+ * Chunking nach Zeichen (nicht Tokens). 8k chars ~ grob ein paar tausend Tokens.
+ * Overlap hilft, wenn eine wichtige Info genau an einer Chunk-Grenze liegt.
+ */
+function chunkTextByChars(text, chunkSize = 8000, overlap = 800) {
+  const chunks = [];
+  const t = normalizeText(text);
+  if (!t) return chunks;
+
+  let i = 0;
+  while (i < t.length) {
+    const end = Math.min(i + chunkSize, t.length);
+    const chunk = t.slice(i, end).trim();
+    if (chunk) chunks.push(chunk);
+    if (end >= t.length) break;
+    i = Math.max(0, end - overlap);
+  }
+  return chunks;
+}
+
+async function extractTextFromFile(localPath, originalName) {
+  const ext = path.extname(originalName).toLowerCase();
+
+  if (ext === ".pdf") {
+    const buf = fs.readFileSync(localPath);
+    const parsed = await pdfParse(buf);
+    return normalizeText(parsed.text);
+  }
+
+  if (ext === ".docx") {
+    const buf = fs.readFileSync(localPath);
+    const result = await mammoth.extractRawText({ buffer: buf });
+    return normalizeText(result.value);
+  }
+
+  if ([".txt", ".md", ".csv", ".html", ".json"].includes(ext)) {
+    return normalizeText(fs.readFileSync(localPath, "utf8"));
+  }
+
+  // .doc (alt) o. ä. -> kein Extracting
+  return null;
+}
+
+function makeSafeBaseName(originalName) {
+  // Dateinamen „normalisieren“, damit keine komischen Zeichen in tmp-Files landen
+  return originalName
+    .normalize("NFKD")
+    .replace(/[^\w.\- ()äöüÄÖÜß]/g, "_");
+}
+
+async function uploadChunkAsTextFile({ vectorStoreId, originalName, chunkIndex, chunkText }) {
+  const tmpDir = "uploads";
+  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+
+  const safeBase = makeSafeBaseName(originalName);
+  const tmpName = `${safeBase}.part-${String(chunkIndex).padStart(3, "0")}.txt`;
+  const tmpPath = path.join(tmpDir, tmpName);
+
+  fs.writeFileSync(tmpPath, chunkText, "utf8");
+
+  const uploaded = await openai.files.create({
+    file: fs.createReadStream(tmpPath),
+    purpose: "assistants"
+  });
+
+  await openai.vectorStores.files.create(vectorStoreId, { file_id: uploaded.id });
+
+  safeUnlink(tmpPath);
+  return { file_id: uploaded.id, part_name: tmpName };
+}
+
+// --- Routes ---
 app.get("/", (req, res) => {
   res.type("text").send(
     "Onboarding Bot running.\n\n" +
@@ -66,7 +143,7 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Mobile Web UI (+ Upload)
+// Mobile Web UI (Upload + Chat)
 app.get("/chat", (req, res) => {
   const token = (process.env.API_TOKEN || "").replaceAll('"', '\\"');
 
@@ -100,7 +177,9 @@ app.get("/chat", (req, res) => {
   <main>
     <details open>
       <summary><b>Dokumente hochladen</b></summary>
-      <p class="small">PDF/DOCX/TXT auswählen → Upload → danach Fragen stellen.</p>
+      <p class="small">
+        PDFs/DOCX werden serverseitig in Text extrahiert und automatisch in Chunks zerlegt (bessere Suche, weniger Rate-Limits).
+      </p>
       <input id="files" type="file" multiple />
       <button id="uploadBtn">Upload</button>
       <div id="uploadStatus" class="small"></div>
@@ -148,9 +227,12 @@ app.get("/chat", (req, res) => {
       });
       const data = await r.json();
       if(!r.ok) throw new Error(data.error || "Upload failed");
-      uploadStatus.textContent = "✅ Upload OK. Vector Store: " + data.vector_store_id;
+      uploadStatus.textContent = "✅ Upload OK. Vector Store: " + data.vector_store_id +
+        " · Dateien: " + (data.uploaded?.length || 0);
+      addCard("System", "Upload abgeschlossen. Du kannst jetzt Fragen stellen.");
     }catch(e){
       uploadStatus.textContent = "❌ " + e.message;
+      addCard("Fehler", e.message);
     }
   }
 
@@ -192,28 +274,66 @@ app.get("/chat", (req, res) => {
 </html>`);
 });
 
-// Upload -> Files API -> Vector Store
+// Upload docs -> Extract -> Chunk -> Upload .txt parts -> Vector Store
 app.post("/api/upload", upload.array("files", 10), async (req, res) => {
   const files = req.files || [];
   if (!files.length) return res.status(400).json({ error: "No files uploaded. Use field name: files" });
+
+  // Tuning (optional als Env Vars setzen)
+  const CHUNK_SIZE = Number(process.env.CHUNK_SIZE || 8000);        // chars
+  const CHUNK_OVERLAP = Number(process.env.CHUNK_OVERLAP || 800);   // chars
+  const PAUSE_MS = Number(process.env.UPLOAD_PAUSE_MS || 600);      // ms, gegen Rate-Limits
 
   try {
     const vectorStoreId = await ensureVectorStore();
     const results = [];
 
     for (const f of files) {
-      const uploaded = await openai.files.create({
-        file: fs.createReadStream(f.path),
-        purpose: "assistants"
-      });
+      try {
+        const extracted = await extractTextFromFile(f.path, f.originalname);
 
-      await openai.vectorStores.files.create(vectorStoreId, { file_id: uploaded.id });
+        if (extracted && extracted.length > 0) {
+          const chunks = chunkTextByChars(extracted, CHUNK_SIZE, CHUNK_OVERLAP);
 
-      let ready = false;
-      try { ready = await waitForVectorFileReady(vectorStoreId, uploaded.id); } catch { ready = false; }
+          const partUploads = [];
+          for (let i = 0; i < Math.max(1, chunks.length); i++) {
+            const chunkText = chunks[i] || extracted; // falls chunks leer, dann ganzes Dokument
+            const out = await uploadChunkAsTextFile({
+              vectorStoreId,
+              originalName: f.originalname,
+              chunkIndex: i + 1,
+              chunkText
+            });
+            partUploads.push(out);
 
-      results.push({ original_name: f.originalname, file_id: uploaded.id, ready });
-      safeUnlink(f.path);
+            if (PAUSE_MS > 0) await new Promise(r => setTimeout(r, PAUSE_MS));
+          }
+
+          results.push({
+            original_name: f.originalname,
+            mode: "chunked",
+            chunks: partUploads.length,
+            parts: partUploads // {file_id, part_name}
+          });
+        } else {
+          // Fallback: Originaldatei hochladen, wenn Extract nicht geht
+          const uploaded = await openai.files.create({
+            file: fs.createReadStream(f.path),
+            purpose: "assistants"
+          });
+
+          await openai.vectorStores.files.create(vectorStoreId, { file_id: uploaded.id });
+
+          results.push({
+            original_name: f.originalname,
+            mode: "original",
+            chunks: 0,
+            parts: [{ file_id: uploaded.id, part_name: f.originalname }]
+          });
+        }
+      } finally {
+        safeUnlink(f.path);
+      }
     }
 
     res.json({ vector_store_id: vectorStoreId, uploaded: results });
@@ -239,7 +359,7 @@ app.post("/api/chat", async (req, res) => {
           content:
             "Du bist ein Mitarbeiter-Onboarding-Assistant. " +
             "Antworte NUR auf Basis der bereitgestellten Onboarding-Dokumente. " +
-            "Wenn du nichts findest, sag: 'Dazu finde ich nichts in den Onboarding-Unterlagen.' " +
+            "Wenn du nichts Relevantes findest, sag klar: 'Dazu finde ich nichts in den Onboarding-Unterlagen.' " +
             "Gib kurze, umsetzbare Schritte. Keine Spekulation."
         },
         { role: "user", content: message }
@@ -247,7 +367,11 @@ app.post("/api/chat", async (req, res) => {
       tools: [{ type: "file_search", vector_store_ids: [vectorStoreId] }]
     });
 
-    res.json({ answer: response.output_text, response_id: response.id, vector_store_id: vectorStoreId });
+    res.json({
+      answer: response.output_text,
+      response_id: response.id,
+      vector_store_id: vectorStoreId
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
